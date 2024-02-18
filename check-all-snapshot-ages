@@ -1,72 +1,339 @@
-## 
+#!/bin/bash
 
-This script will look fpr all datasets and snapshots on a FreeNAS/TrueNAS/ZFS system and check the age of the snapshots. 
-It will check all Datasets which have snapshots and check the age of the snapshots.
-If you want to make sure that some datasets are checked even if they have no snapshots, you can add them to the IMPORTANT variable.
-It will create a check_mk_agent plugin for the check_mk monitoring system.
+# Author: Wim Bonis
+# Title: Check all ZFS snapshot ages
+# Description: This script checks the age of all ZFS snapshots on a system.
+# email: wb at stylite dot de
+# Date: 2024-02-18
+# Version: 1.0
+# License: MIT
 
-## Deployment
-
-Copy the script to the local directory of the check_mk_agent "/usr/lib/check_mk_agent/local"
-```sh
-cp check-all-snapshot-ages /usr/lib/check_mk_agent/local/
-chmod +x /usr/lib/check_mk_agent/local/check-all-snapshot-ages
-```
-A config file will be created in the same directory with the name "check-all-snapshot-ages.conf". This file contains the configuration for the check_mk_agent plugin. The file should be edited to match the configuration of the system.
-
-If you want a different check witch different configuration, you can copy (or symlink) the script to a different name and edit the configuration file that will be created.
-
-## Configuration
-
-```sh
-# Empty for all pools, but it will also check the freenas-boot pool
-#POOL=""
-# one pool
-POOL="pool"
-# multiple pools separated by space
-#POOL="pool1 pool2 pool3"
-
-# Prefix for the service name in check_mk
-# Default is the name of the Script
-#PREFIX="snap-ALL"
-
-# IMPORTANT datasets, which should be checked, even they have no Snapshots
-# can be empty
-#IMPORTANT="\
-#pool/NFS01 \
-#pool2/SMB01 \
-#pool2/SMB02 \
-#"
-
-# Filter for snapshots, if empty, all snapshots are checked
-#SNAPFILTER=""
-#select all snapshots which are beginning with this string
-#SNAPFILTER="auto-"
-# As a regex include the @ in the beginning
-#SNAPFILTER="@auto|@hourly"
-
-# For All snapshots older define some limits
+# This script checks the age of all ZFS snapshots on a system.
+# It can be used to monitor the age of ZFS snapshots and to alert if the age exceeds a certain threshold.
+# The script can be used with Checkmk to monitor ZFS snapshots.
 #
-# The newest snapshot should be younger than this
-# The age is in minutes
-#MY_WARNAGE=90 # Default is 90 minutes
-#MY_CRITAGE=180 # Default is 180 minutes
+# Put this script in the local directory of your Checkmk agent.
+# For example: /usr/lib/check_mk_agent/local/check_all_snapshot_ages
+# The configuration file for this script is check_all_snapshot_ages.conf
+# If it not exists, it will be created with default values.
+# The configuration file must be in the same directory as the script.
 
-# The oldest snapshot be inbetween this days
-# This logic is different from other checks,
-# as the age should be inbetween the two values!!
-# The age is in days
-#MY_OLDEST_WARNAGE=2 # Default is 27 days
-#MY_OLDEST_CRITAGE=180 # Default is 180 days
+# Read the configuration from a file
+SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
+# remove extension of my the script name like .sh
+SCRIPT_NAME_PLAIN="${SCRIPT_NAME%.*}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="$SCRIPT_DIR/$SCRIPT_NAME_PLAIN.conf"
 
-# The number of snapshots whihc are allowed
-#MY_SNAP_COUNT_WARN=200 # Default is 200
-#MY_SNAP_COUNT_CRIT=500 # Default is 500
+if [ -r "$CONFIG_FILE" ]; then
+  source "$CONFIG_FILE"
+else
+  echo "Config file $CONFIG_FILE not found or not readable"
+  # create a default config file
+  cat << EOF | sed -r 's/^ {4}//' > "$CONFIG_FILE" # remove leading spaces
+    # Configuration file for $SCRIPT_NAME_PLAIN
+    # This file is sourced by the script $SCRIPT_NAME
+    #
+    # Empty for all pools, but it will also check the freenas-boot pool
+    #POOL=""
+    # one pool
+    POOL="pool"
+    # multiple pools separated by space
+    #POOL="pool1 pool2 pool3"
 
-# Ignore some datasets
-IGNORE="/home|/iocage|/ix-applications|/\.|/tmp|/test|-tmp|-test" # Ignore hidden datasets this is a regex for grep -Ev
-```
+    # Prefix for the service name in check_mk
+    # Default is the name of the Script
+    #PREFIX="snap-ALL"
 
-## License
+    # IMPORTANT datasets, which should be checked, even they have no Snapshots
+    # can be empty
+    #IMPORTANT="\
+    #pool/NFS01 \
+    #pool2/SMB01 \
+    #pool2/SMB02 \
+    #"
 
-This project is licensed under the MIT License
+    # Filter for snapshots, if empty, all snapshots are checked
+    #SNAPFILTER=""
+    #select all snapshots which are beginning with this string
+    #SNAPFILTER="auto-"
+    # As a regex include the @ in the beginning
+    #SNAPFILTER="@auto|@hourly"
+
+    # For All snapshots older define some limits
+    #
+    # The newest snapshot should be younger than this
+    # The age is in minutes
+    #MY_WARNAGE=90 # Default is 90 minutes
+    #MY_CRITAGE=180 # Default is 180 minutes
+
+    # The oldest snapshot be inbetween this days
+    # This logic is different from other checks,
+    # as the age should be inbetween the two values!!
+    # The age is in days
+    #MY_OLDEST_WARNAGE=2 # Default is 27 days
+    #MY_OLDEST_CRITAGE=180 # Default is 180 days
+
+    # The number of snapshots whihc are allowed
+    #MY_SNAP_COUNT_WARN=200 # Default is 200
+    #MY_SNAP_COUNT_CRIT=500 # Default is 500
+
+    # Ignore some datasets
+    IGNORE="/home|/iocage|/ix-applications|/\.|/tmp|/test|-tmp|-test" # Ignore hidden datasets this is a regex for grep -Ev
+EOF
+  exit 3
+fi
+
+# Set the default values if the variables are not set
+MY_WARNAGE=${MY_WARNAGE:-90}
+MY_CRITAGE=${MY_CRITAGE:-180} 
+MY_OLDEST_WARNAGE=${MY_OLDEST_WARNAGE:-27}
+MY_OLDEST_CRITAGE=${MY_OLDEST_CRITAGE:-180}
+MY_SNAP_COUNT_WARN=${MY_SNAP_COUNT_WARN:-200}
+MY_SNAP_COUNT_CRIT=${MY_SNAP_COUNT_CRIT:-500}
+
+# If PREFIX is empty, use the script name as prefix
+PREFIX=${PREFIX:-$SCRIPT_NAME_PLAIN}
+
+if [ -z "$IGNORE" ]; then
+  IGNORE="^$" # If IGNORE is empty, don't ignore anything
+fi
+
+#
+# Begin of function check_snapshot_age
+#
+check_snapshot_age() {
+  # Usage: check_snapshot_age <dataset> [<snapfilter>] [<warnage>] [<critage>] [<oldest_warnage>] [<oldest_critage>] [<snapcount_warn>] [<snapcount_crit>]
+  #
+  # It uses the ALLSNAPS variable, which contains the output of "zfs get -Hpr -t snapshot creation $POOL"
+  # 
+  # This function checks the age of the newest snapshot of a ZFS filesystem.
+
+  # It takes arguments:
+  # - <dataset>: The name of the ZFS dataset to check.
+  # - <snapfilter>: The filter for the snapshot name, can be empty
+  # - <warnage>: The warning threshold in minutes. If the age of the newest snapshot exceeds this threshold, a warning is raised, can be empty
+  # - <critage>: The critical threshold in minutes. If the age of the newest snapshot exceeds this threshold, a critical alert is raised, can be empty
+  # - <oldest_warnage>: The warning threshold for the oldest snapshot in days. If the age of the oldest snapshot exceeds this threshold, a warning is raised, can be empty
+  # - <oldest_critage>: The critical threshold for the oldest snapshot in days. If the age of the oldest snapshot exceeds this threshold, a critical alert is raised, can be empty
+  # - <snapcount_warn>: The warning threshold for the number of snapshots. If the number of snapshots exceeds this threshold, a warning is raised, can be empty
+  # - <snapcount_crit>: The critical threshold for the number of snapshots. If the number of snapshots exceeds this threshold, a critical alert is raised, can be empty
+  # 
+  # Example usage: check_snapshot_creation tank/data 90 180
+  # This will check the age of the newest snapshot of the "tank/data" ZFS filesystem.
+  # If the age is between 90 and 180 minutes, a warning will be raised.
+  # If the age is greater than 180 minutes, a critical alert will be raised.
+
+  # The oldest snap should be older then 27 days but not older than 180 days
+  # USAGE="Usage: check_snapshot_age <dataset> [<snapfilter>] [<warnage>] [<critage>] [<oldest_warnage>] [<oldest_critage>] [<snapcount_warn>] [<snapcount_crit>]"
+
+  local dataset=${1:-""} # name of the zfs filesystem
+  local snapshotfilter=${2:-""} # filter for snapshots can be used to filter for a specific snapshot, can be empty
+
+  local warnage_minutes=${3:-90}
+  local critage_minutes=${4:-180}
+  local oldest_warnage_days=${5:-27}
+  local oldest_critage_days=${6:-180}
+  local snap_count_warn=${7:-200}
+  local snap_count_crit=${8:-500}
+
+  if [ -z "$dataset" ]; then
+    echo "3 $PREFIX:$dataset no dataset given"
+    return 3
+  fi
+
+  if (( warnage_minutes > critage_minutes )); then
+    echo "3 $PREFIX:$dataset Newest Warning time must be smaller than crittime"
+    return 3
+  fi
+  if (( oldest_warnage_days > oldest_critage_days )); then
+    echo "3 $PREFIX:$dataset Oldest Warning time must be smaller than crittime"
+    return 3
+  fi
+  if (( snap_count_warn > snap_count_crit )); then
+    echo "3 $PREFIX:$dataset count must be smaller than crittime"
+    return 3
+  fi
+
+  local warnage=$((warnage_minutes*60)) # convert minutes to seconds
+  local critage=$((critage_minutes*60)) # convert minutes to seconds
+
+  local now=$(date +%s)
+
+  #ALL_SNAPLIST=$(zfs get creation -Hpr -t snapshot $dataset)
+  local all_snaplist=$(echo "$ALLSNAPS"|grep -E "$dataset@")
+  
+  if [ -z "$all_snaplist" ]; then
+    echo "2 $PREFIX:$dataset MISSING: no snapshots found for $dataset"
+    return 3
+  fi
+  
+  local snaplist=""
+  # get all snapshots of zfs filesystem and search for newest snapshot
+  if [ -z "$snapshotfilter" ]; then
+    snaplist="$all_snaplist"
+  else
+    # When snapshotfilter starts with @, its a regex
+    if [[ "$snapshotfilter" == "@"* ]]; then
+      snaplist=$(echo "$all_snaplist" | grep -E "$snapshotfilter")
+    else
+      snaplist=$(echo "$all_snaplist" | grep "@$snapshotfilter")
+    fi
+  fi
+  #echo "snaplist: $snaplist"
+  if [ -z "$snaplist" ]; then
+    echo "2 $PREFIX:$dataset MISSING: no snapshots found for $dataset with filter $snapshotfilter"
+    return 3
+  fi
+
+  local size_snap_text=$(zfs list -o usedsnap $dataset | tail -n 1 | awk '{print $1}')
+  # Convert the size to bytes depending on the unit (K, M, G, T, P, E, Z, Y)
+  local size_snap=$(echo $size_snap_text | awk '{print $1 * (1024 ** index("KMGTPEZY", substr($2,1,1)))}')
+
+  local snapcount=$(echo "$snaplist" | wc -l)
+  local creationdate=$(echo "$snaplist"| awk 'BEGIN {max = 0} {if ($3>max) max=$3} END {print max}')
+  local oldest_creationdate=$(echo "$snaplist"| awk 'BEGIN {min = 9999999999 } {if ($3<min) min=$3} END {print min}')
+
+  local newest_snap_name=$(echo "$snaplist"| awk -v search=$creationdate '{if ($3==search) print $1}'|tail -n 1)
+  # FreeBSD has no date -d option so we use awk
+  # local newest_snap_date=$(date -d @$creationdate +"%Y-%m-%d_%H:%M:%S")
+  local newest_snap_date=$(awk 'BEGIN { print strftime("%Y-%m-%d_%H:%M:%S", '$creationdate' ) }')
+
+
+  local oldest_snap_name=$(echo "$snaplist"| awk -v search=$oldest_creationdate '{if ($3==search) print $1}'|tail -n 1)
+  # local oldest_snap_date=$(date -d @$oldest_creationdate +"%Y-%m-%d_%H:%M:%S")
+  local oldest_snap_date=$(awk 'BEGIN { print strftime("%Y-%m-%d_%H:%M:%S", '$oldest_creationdate' ) }')
+
+  local newest_diff=$((now-creationdate))
+  local newest_diff_minutes=$(( newest_diff/60 ))
+  local newest_diff_hours=$(( newest_diff/(60*60) ))
+  local newest_diff_days=$(( newest_diff/(60*60*24) ))
+
+  local oldest_diff=$((now-oldest_creationdate))
+  local oldest_diff_minutes=$(( oldest_diff/60 ))
+  local oldest_diff_hours=$(( oldest_diff/(60*60) ))
+  local oldest_diff_days=$(( oldest_diff/(60*60*24) ))
+
+
+
+  local retval=3 # UNKNOWN
+  local msg="Empty"
+
+  local newest_retval=0 # OK
+  local oldest_retval=0 # OK
+  local snap_retval=0 # OK
+
+  if (( newest_diff > critage )); then
+    newest_retval=2 # CRITICAL
+    newest_msg="CRITICAL: Newest snapshot is older than $critage_minutes minutes"
+  elif (( newest_diff > warnage )); then
+    newest_retval=1 # WARNING
+    newest_msg="WARNING: Newest snapshot is older than $warnage_minutes minutes"
+  else
+    newest_retval=0 # OK
+    newest_msg="OK:"
+  fi
+
+# The oldest snap should lay inbetween oldest_warnage_days and oldest_critage_days days. This is different logic than other checks!!
+  if (( oldest_diff_days > oldest_critage_days )); then
+    oldest_retval=2 # CRITICAL
+    oldest_msg="CRITICAL: Oldest snapshot is older than $oldest_critage_days days"
+  elif (( oldest_diff_days < oldest_warnage_days )); then
+    oldest_retval=1 # WARNING
+    oldest_msg="WARNING: Oldest snapshot is younger than $oldest_warnage_days days"
+  else
+    oldest_retval=0 # OK
+    oldest_msg="OK:"
+  fi
+
+  if (( snapcount > snap_count_crit )); then
+    snap_retval=2 # CRITICAL
+    snap_msg="CRITICAL: Snapcount $snapcount is greater than $snap_count_crit"
+  elif (( snapcount > snap_count_warn )); then
+    snap_retval=1 # WARNING
+    snap_msg="WARNING: Snapcount $snapcount is greater than $snap_count_warn"
+  else
+    snap_retval=0 # OK
+    snap_msg="OK:"
+  fi
+
+  # Find the greatest return value of the checks
+  retval=$((newest_retval>oldest_retval?newest_retval:oldest_retval))
+  retval=$((retval>snap_retval?retval:snap_retval))
+
+  # Get all messages in one line
+  msg="$newest_msg $oldest_msg $snap_msg"
+
+  echo -n "$retval $PREFIX:$dataset age=${newest_diff};${warnage};${critage}|creation=${creationdate};${oldest_creationdate};|file_size=0;;|fs_used=$size_snap;;|file_count=${snapcount};${snap_count_warn};${snap_count_crit} "
+
+  if (( retval == 3 )); then
+    echo "UNKNOWN: $msg"
+  elif (( retval == 0 )); then
+    #echo "$newest_msg newest snapshot $newest_snap_name created on $newest_snap_date (${newest_diff_minutes} minutes ago)"
+    echo "OK: newest ${newest_diff_minutes} min, oldest $oldest_diff_days days, count $snapcount, used $size_snap_text"
+  elif (( retval == 1 )); then
+      if (( newest_retval == 1 )); then
+      echo "$newest_msg - $newest_snap_name created on $newest_snap_date (${newest_diff_minutes} minutes ago)"
+    elif (( oldest_retval == 1 )); then
+      echo "$oldest_msg - $oldest_snap_name created on $oldest_snap_date (${oldest_diff_days} days ago)"
+    elif (( snap_retval == 1 )); then
+      echo "$snap_msg Snapcount is $snapcount, used $size_snap_text"
+    else
+      echo "WARN: $msg"
+    fi
+  elif (( retval == 2 )); then
+    if (( newest_retval == 2 )); then
+      echo "$newest_msg - $newest_snap_name created on $newest_snap_date (${newest_diff_minutes} minutes ago)"
+    elif (( oldest_retval == 2 )); then
+      echo "$oldest_msg - $oldest_snap_name created on $oldest_snap_date (${oldest_diff_days} days ago)"
+    elif (( snap_retval == 2 )); then
+      echo "$snap_msg Snapcount is $snapcount, used $size_snap_text"
+    else
+      echo "CRIT: $msg"
+    fi
+  else # 1 or 2 get one of the messages
+    echo "UNKNOWN: $msg"
+  fi
+
+  return $retval
+}
+#
+# End of function check_snapshot_age
+#
+
+#
+# Begin of main script
+ALLSNAPS=$(zfs get -Hpr -t snapshot creation $POOL)
+
+#echo "$ALLSNAPS"
+# All Datasets witch have a snapshot
+DATASETS=$(echo "$ALLSNAPS" | awk -F@ '{print $1}' | sort | uniq | grep -Ev "$IGNORE")
+# get just the dataset names
+#DATASETS=$(zfs list -H -o name -r $POOL | sort | uniq | grep -Ev "$IGNORE")
+#echo "DATASETS: $DATASETS"
+
+# Check if the important datasets are in the list
+for IMP in $IMPORTANT; do
+  if ! echo "$DATASETS" | grep -qE "^${IMP}$"; then
+    # Add the missing dataset to the list with a newline
+    DATASETS="$IMP"$'\n'"$DATASETS"
+  else
+    # Put the important datasets to the top of the list
+    DATASETS=$(echo $IMP ; echo "$DATASETS" | grep -vE "^${IMP}$")
+  fi
+done
+
+# If DATASETS is empty, exit with an error
+if [ -z "$DATASETS" ]; then
+  echo "3 $PREFIX: No datasets found"
+  exit 3
+fi
+
+# Now for each dataset, call the check_snapshot_age function
+for DS in $DATASETS; do
+  # Get the Size of all the snapshots of the dataset
+
+  check_snapshot_age "$DS" "$SNAPFILTER" $MY_WARNAGE $MY_CRITAGE $MY_OLDEST_WARNAGE $MY_OLDEST_CRITAGE $MY_SNAP_COUNT_WARN $MY_SNAP_COUNT_CRIT
+done
+
+exit 0

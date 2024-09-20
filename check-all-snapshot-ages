@@ -164,7 +164,7 @@ check_snapshot_age() {
   local all_snaplist=$(echo "$ALLSNAPS"|grep -E "$dataset@")
   
   if [ -z "$all_snaplist" ]; then
-    echo "2 $PREFIX:$dataset MISSING: no snapshots found for $dataset"
+    echo "2 $PREFIX:$dataset - MISSING: no snapshots found for $dataset"
     return 3
   fi
   
@@ -182,7 +182,7 @@ check_snapshot_age() {
   fi
   #echo "snaplist: $snaplist"
   if [ -z "$snaplist" ]; then
-    echo "2 $PREFIX:$dataset MISSING: no snapshots found for $dataset with filter $snapshotfilter"
+    echo "2 $PREFIX:$dataset - MISSING: no snapshots found for $dataset with filter $snapshotfilter"
     return 3
   fi
 

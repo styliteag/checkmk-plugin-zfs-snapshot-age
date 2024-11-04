@@ -67,6 +67,10 @@ POOL="pool"
 IGNORE="/home|/iocage|/ix-applications|/\.|/tmp|/test|-tmp|-test" # Ignore hidden datasets this is a regex for grep -Ev
 ```
 
+## Check scrub status
+
+I added check_zfs_scrub it monitors the execution of scrub
+
 ## License
 
 This project is licensed under the MIT License

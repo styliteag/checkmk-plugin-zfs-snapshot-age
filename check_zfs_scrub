@@ -1,0 +1,212 @@
+#! /bin/bash
+
+# Check if a "zfs scrub" command is running on a ZFS pool and report the status to Nagios/check_mk
+
+# Usage: ./check_zfs_scrub.sh [-w <runtime_warning_threshold>] [-c <runtime_critical_threshold>] [-a <last_run_warning_threshold>] [-b <last_run_critical_threshold>]
+
+# The thresholds are in seconds
+
+# These are the default thresholds
+runtime_warning_threshold=$((10 * 60)) # 10 minutes in seconds
+runtime_critical_threshold=$((8 * 60 * 60)) # 8 hours in seconds
+
+last_run_warning_threshold=60 # 60 days
+last_run_critical_threshold=90 # 90 days
+
+# Read the thresholds from the command line arguments if they are provided
+while getopts ":w:c:a:b:" opt; do
+    case ${opt} in
+        w )
+            runtime_warning_threshold=$OPTARG
+            # Check if the threshold is a number
+            if ! [[ $runtime_warning_threshold =~ ^[0-9]+$ ]]; then
+                echo "Invalid threshold: $runtime_warning_threshold" 1>&2
+                exit 3
+            fi
+            ;;
+        c )
+            runtime_critical_threshold=$OPTARG
+            # Check if the threshold is a number
+            if ! [[ $runtime_critical_threshold =~ ^[0-9]+$ ]]; then
+                echo "Invalid threshold: $runtime_critical_threshold" 1>&2
+                exit 3
+            fi
+            ;;
+        a )
+            last_run_warning_threshold=$OPTARG
+            # Check if the threshold is a number
+            if ! [[ $last_run_warning_threshold =~ ^[0-9]+$ ]]; then
+                echo "Invalid threshold: $last_run_warning_threshold" 1>&2
+                exit 3
+            fi
+            ;;
+        b )
+            last_run_critical_threshold=$OPTARG
+            # Check if the threshold is a number
+            if ! [[ $last_run_critical_threshold =~ ^[0-9]+$ ]]; then
+                echo "Invalid threshold: $last_run_critical_threshold" 1>&2
+                exit 3
+            fi
+            ;;
+        \? )
+            echo "Invalid option: $OPTARG" 1>&2
+            exit 3
+            ;;
+        : )
+            echo "Invalid option: $OPTARG requires an argument" 1>&2
+            exit 3
+            ;;
+    esac
+done
+
+# Function to get Unix timestamp
+get_unix_timestamp() {
+    if [ "$(uname)" = "FreeBSD" ]; then
+        date -j -f "%a %b %d %T %Y" "$1" "+%s" 2>/dev/null || date -j -f "%Y-%m-%d %H:%M:%S" "$1" "+%s" 2>/dev/null || echo "0"
+    else
+        date -d "$1" +%s 2>/dev/null || echo "0"
+    fi
+}
+
+# Function to get current Unix timestamp
+get_current_timestamp() {
+    date +%s
+}
+
+function check_one_pool {
+    pool_name=$1
+
+    # Check if the pool exists
+    if ! zpool list -H -o name $pool_name > /dev/null 2>&1; then
+        echo "Pool '$pool_name' does not exist"
+        exit 3
+    fi
+
+    # Get the scrub status by searching for scan: and including the next line starting with empty space
+    scrub_output_full=$(zpool status $pool_name | sed -n '/^ *scan:/,/^[^[:space:]]/p' | sed '$d') # the sed '$d' is to delete the last line
+
+    # zpool status poolXXXX | grep -i scrub
+    # For testing:
+    #scrub_output_full="  scan: scrub in progress since Sun Oct 13 00:00:09 2024
+    #    76.7T scanned at 337M/s, 68.0T issued at 299M/s, 81.5T total
+    #    123B repaired, 83.49% done, 13:07:06 to go"
+    #scrub_output_full="  scan: scrub repaired 0B in 00:00:14 with 0 errors on Wed Oct  9 03:45:14 2024"
+    #  Scrubbing and resilvering are very similar operations. The difference is that resilvering only examines data that ZFS knows to be out of date (for example, when attaching a new device to a mirror or replacing an existing device), whereas scrubbing examines all data to discover silent errors due to hardware faults or disk failure.
+    #scrub_output_full="  scan: resilvered 10.2G in 00:21:55 with 0 errors on Mon Sep 23 11:47:01 2024"
+    #scrub_output_full=""
+
+
+    # Put the scrub output in a variable on a single line
+    scrub_output=$(echo $scrub_output_full | tr '\n' ' ')
+
+    scrub_running=0
+    scrub_repaired=0
+    scrub_timeleft=0
+    scrub_errors=0
+    scrub_percent=""
+    scrub_start=""
+    scrub_duration=0
+    scrub_estimated_time=0
+    time_since_last_scrub=0
+
+    if [[ $scrub_output == *"in progress"* ]]; then
+        scrub_running=1
+        scrub_percent=$( echo "$scrub_output" | sed -n 's/.* \([.0-9]*\)% done.*/\1/p')
+        scrub_timeleft=$(echo "$scrub_output" | sed -n 's/.* \([:0-9]*\) to go.*/\1/p')
+        scrub_repaired=$(echo "$scrub_output" | sed -nE 's/.*[^0-9]([.0-9]+)[BKMGTPE] repaired.*/\1/p')
+        scrub_start=$(   echo "$scrub_output" | sed -n 's/.*since \(.*[0-9]\{4\}\).*/\1/p')
+        # Convert scrub start time to Unix timestamp
+        scrub_start_timestamp=$(get_unix_timestamp "$scrub_start")
+        # Get current timestamp
+        current_timestamp=$(get_current_timestamp)
+        # Calculate the duration of the scrub in seconds
+        scrub_duration=$((current_timestamp - scrub_start_timestamp))
+        # Convert scrub time left to seconds
+        scrub_estimated_time=$(echo "$scrub_timeleft" | awk -F: '{ print ($1 * 3600) + ($2 * 60) + $3 }')
+    elif [[ $scrub_output == *"repaired"* ]]; then
+        scrub_running=0
+        scrub_repaired=$(echo "$scrub_output" | sed -n 's/.*repaired \([.0-9]*\)[BKMGTPE].*/\1/p')
+        scrub_errors=$(echo "$scrub_output" | sed -n 's/.*with \([0-9]*\) errors.*/\1/p')
+        scrub_duration=$(echo "$scrub_output" | sed -n 's/.*in \([0-9][0-9]*:[0-9][0-9]*:[0-9][0-9]*\).*/\1/p')
+        # Convert scrub duration to seconds
+        scrub_duration_seconds=$(echo "$scrub_duration" | awk -F: '{ print ($1 * 3600) + ($2 * 60) + $3 }')
+        # Get the last scrub time
+        last_scrub_time=$(echo "$scrub_output" | sed -n 's/.* on \(.*\)$/\1/p')
+        # Convert last scrub time to Unix timestamp
+        last_scrub_timestamp=$(get_unix_timestamp "$last_scrub_time")
+        # Get current timestamp
+        current_timestamp=$(get_current_timestamp)
+        # Calculate the time since the last scrub in days
+        time_since_last_scrub=$(( (current_timestamp - last_scrub_timestamp) / 86400 ))
+    elif [[ $scrub_output == *"resilvered"* ]]; then
+        scrub_running=0
+        scrub_repaired=$(echo "$scrub_output" | sed -n 's/.*resilvered \([.0-9]*\)[BKMGTPE].*/\1/p')
+        scrub_errors=$(echo "$scrub_output" | sed -n 's/.*with \([0-9]*\) errors.*/\1/p')
+        scrub_duration=$(echo "$scrub_output" | sed -n 's/.*in \([0-9][0-9]*:[0-9][0-9]*:[0-9][0-9]*\).*/\1/p')
+        # Convert scrub duration to seconds
+        scrub_duration_seconds=$(echo "$scrub_duration" | awk -F: '{ print ($1 * 3600) + ($2 * 60) + $3 }')
+        # Get the last scrub time
+        last_scrub_time=$(echo "$scrub_output" | sed -n 's/.* on \(.*\)$/\1/p')
+        # Convert last scrub time to Unix timestamp
+        last_scrub_timestamp=$(get_unix_timestamp "$last_scrub_time")
+        # Get current timestamp
+        current_timestamp=$(get_current_timestamp)
+        # Calculate the time since the last scrub in days
+        time_since_last_scrub=$(( (current_timestamp - last_scrub_timestamp) / 86400 ))
+    else
+        scrub_running=9
+        ## echo "Pool '$pool_name' has never been scrubbing"
+    fi
+
+    status=0
+    criticaly="OK"
+
+    if [ $scrub_running -eq 9 ]; then
+        status=1
+        criticaly="WARNING"
+        message="$status \"scrub_$pool_name\" - has no scrubbing information"
+        echo $message
+    elif [ $scrub_running -eq 1 ]; then
+        if [ $scrub_duration -gt $runtime_warning_threshold ]; then
+            status=1
+            criticaly="WARNING"
+        elif [ $scrub_duration -gt $runtime_critical_threshold ]; then
+            status=2
+            criticaly="CRITICAL"
+        else
+            status=0
+            criticaly="OK"
+        fi
+        message="$status \"scrub_$pool_name\" execution_time=$scrub_duration;$runtime_warning_threshold;$runtime_critical_threshold|errors=$scrub_errors;0;0|percent=$scrub_percent;;;0;100|timeleft=$scrub_estimated_time|repaired=$scrub_repaired;0;0 $scrub_output"
+        echo $message
+    elif [ $scrub_running -eq 0 ]; then
+        status=0
+        criticaly="OK"
+        if [ "$scrub_repaired" != "0" ]; then
+            status=1
+            criticaly="WARNING"
+        fi
+        if [ $time_since_last_scrub -gt $last_run_warning_threshold ]; then
+            status=1
+            criticaly="WARNING"
+        fi
+        if [ $time_since_last_scrub -gt $last_run_critical_threshold ]; then
+            status=2
+            criticaly="CRITICAL"
+        fi
+        if [ $scrub_errors -gt 0 ]; then
+            status=2
+            criticaly="CRITICAL"
+        fi
+        message="$status \"scrub_$pool_name\" last_time=$time_since_last_scrub;$last_run_warning_threshold;$last_run_critical_threshold|execution_time=$scrub_duration_seconds|errors=$scrub_errors;0;0|repaired=$scrub_repaired;0;0 $scrub_output"
+        echo $message
+        ## message="0 \"scrub_$pool_name\" - is scrubbing ($scrub_percent% done, $scrub_timeleft to go, $scrub_repaired repaired, since $scrub_start, $scrub_duration seconds) $scrub_output"
+    fi
+}
+
+# Get all the pool names and check each one
+for pool_name in $(zpool list -H -o name); do
+    check_one_pool $pool_name
+done
+
+exit 0
